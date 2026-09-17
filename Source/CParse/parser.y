@@ -70,6 +70,7 @@ static int      inclass = 0;
 static Node    *currentOuterClass = 0; /* for nested classes */
 static String  *last_cpptype = 0;
 static int      inherit_list = 0;
+static int      base_virtual = 0;
 static Parm    *template_parameters = 0;
 static int      parsing_template_declaration = 0;
 static int      extendmode   = 0;
@@ -4042,6 +4043,7 @@ cpp_class_decl: storage_class cpptype idcolon class_virt_specifier_opt inherit L
 		     Setattr($$,"baselist", Getattr($inherit,"public"));
 		     Setattr($$,"protectedbaselist", Getattr($inherit,"protected"));
 		     Setattr($$,"privatebaselist", Getattr($inherit,"private"));
+		     Setattr($$,"virtualbaselist", Getattr($inherit,"virtual"));
 		   }
 		   Setattr($$,"allows_typedef","1");
 
@@ -4287,6 +4289,7 @@ cpp_class_decl: storage_class cpptype idcolon class_virt_specifier_opt inherit L
 		 Setattr($$,"baselist", Getattr($inherit,"public"));
 		 Setattr($$,"protectedbaselist", Getattr($inherit,"protected"));
 		 Setattr($$,"privatebaselist", Getattr($inherit,"private"));
+		 Setattr($$,"virtualbaselist", Getattr($inherit,"virtual"));
 	       }
 	       Setattr($$,"storage",$storage_class);
 	       Setattr($$,"unnamed",unnamed);
@@ -4686,7 +4689,11 @@ cpp_template_decl : TEMPLATE LESSTHAN template_parms GREATERTHAN {
                 }
 
 		/* Function template explicit instantiation declaration (extern template) */
-		| EXTERN TEMPLATE cpp_alternate_rettype idcolon LPAREN parms RPAREN {
+		| EXTERN TEMPLATE cpp_alternate_rettype idcolon LPAREN parms RPAREN CONST_QUAL SEMI {
+			Swig_warning(WARN_PARSE_EXTERN_TEMPLATE, cparse_file, cparse_line, "Extern template ignored.\n");
+                  $$ = 0;
+		}
+		| EXTERN TEMPLATE cpp_alternate_rettype idcolon LPAREN parms RPAREN SEMI {
 			Swig_warning(WARN_PARSE_EXTERN_TEMPLATE, cparse_file, cparse_line, "Extern template ignored.\n");
                   $$ = 0; 
 		}
@@ -5570,7 +5577,16 @@ def_args       : EQUAL definetype {
                }
                ;
 
-parameter_declarator : declarator def_args {
+parameter_declarator : declarator EQUAL definetype LBRACE {
+		 /* A braced default argument, eg. int f(Ptr p = Ptr{nullptr}); */
+		 if (skip_balanced('{','}') < 0) Exit(EXIT_FAILURE);
+		 $$ = $declarator;
+		 $$.defarg = NewStringf("%s%s", $definetype.val, scanner_ccode);
+		 $$.stringdefarg = 0;
+		 $$.numdefarg = 0;
+		 Clear(scanner_ccode);
+            }
+            | declarator def_args {
                  $$ = $declarator;
 		 $$.defarg = $def_args.val;
 		 $$.stringdefarg = $def_args.stringval;
@@ -7354,6 +7370,16 @@ base_list      : base_specifier {
 		   Delete(lprotected);
 		   Delete(lprivate);
 		   Append(Getattr(list,Getattr(base,"access")),name);
+		   if (base_virtual) {
+		     List *lvirtual = Getattr(list,"virtual");
+		     if (!lvirtual) {
+		       lvirtual = NewList();
+		       Setattr(list,"virtual",lvirtual);
+		       Delete(lvirtual);
+		     }
+		     Append(lvirtual,name);
+		     base_virtual = 0;
+		   }
 	           $$ = list;
                }
 
@@ -7362,6 +7388,16 @@ base_list      : base_specifier {
 		   Node *base = $base_specifier;
 		   Node *name = Getattr(base,"name");
 		   Append(Getattr(list,Getattr(base,"access")),name);
+		   if (base_virtual) {
+		     List *lvirtual = Getattr(list,"virtual");
+		     if (!lvirtual) {
+		       lvirtual = NewList();
+		       Setattr(list,"virtual",lvirtual);
+		       Delete(lvirtual);
+		     }
+		     Append(lvirtual,name);
+		     base_virtual = 0;
+		   }
                    $$ = list;
                }
                ;
@@ -7447,7 +7483,7 @@ classkeyopt    : classkey
                | %empty
                ;
 
-opt_virtual    : VIRTUAL
+opt_virtual    : VIRTUAL { base_virtual = 1; }
                | %empty
                ;
 

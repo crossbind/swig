@@ -979,8 +979,19 @@ num_common: {
 
       if (strcmp(yytext, "extern") == 0)
 	return (EXTERN);
-      if (strcmp(yytext, "const") == 0)
+      if (strcmp(yytext, "const") == 0) {
+	/* The grammar reads storage classes first, so `const static int x;` is scanned as `static const int x;`. */
+	int nexttok;
+	do {
+	  nexttok = Scanner_token(scan);
+	} while (nexttok == SWIG_TOKEN_ENDLINE || nexttok == SWIG_TOKEN_COMMENT);
+	if (nexttok == SWIG_TOKEN_ID && strcmp(Char(Scanner_text(scan)), "static") == 0) {
+	  scanner_next_token(CONST_QUAL);
+	  return (STATIC);
+	}
+	Scanner_pushtoken(scan, nexttok, Scanner_text(scan));
 	return (CONST_QUAL);
+      }
       if (strcmp(yytext, "static") == 0)
 	return (STATIC);
       if (strcmp(yytext, "struct") == 0)
