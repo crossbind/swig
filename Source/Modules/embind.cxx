@@ -485,12 +485,26 @@ static bool inheritsVirtually(Node *cls, Node *base) {
 
 static bool usesPointerRuntime = false;
 static String *deferredBlocks = 0;
+static String *fieldBindings = 0;
+static String *skippedBindings = 0;
+
+// A bridge build hides SWIG's output, so each binding embind skips is also written beside the bridge, where crossbind shows it.
+static void warnSkipped(Node *n, int code, String *message) {
+  Swig_warning(code, Getfile(n), Getline(n), "%s\n", message);
+  Printf(skippedBindings, "%s:%d: %s\n", Getfile(n), Getline(n), message);
+  Delete(message);
+}
 
 // Bridges of several headers link into one module, and embind stops the module when a type or a public name is
 // registered twice: GDAL declares GDALVersionInfo in both gdal.h and ogr_core.h, and PROJ has an enum named Type in three
 // classes. Each registration is claimed first, so a repeated one is skipped and the first bridge's registration stands.
+// A field binds by its C++ type, which the compiler resolves through typedefs SWIG never read (zlib's uInt comes from a
+// zconf.h the interface does not include): a number, bool or std::string by member pointer, an enum as its underlying
+// integer, a data pointer through the pointer runtime. Arrays, function pointers and fields of any other type stay
+// unbound. A constant registers as a number, a boolean or a string: web embind hands a constant over as a double, so every
+// number becomes one on every runtime.
 static const char *REGISTRATION_RUNTIME =
-  "#include <set>\n#include <string>\n#include <typeinfo>\n\n"
+  "#include <set>\n#include <string>\n#include <type_traits>\n#include <typeinfo>\n\n"
   "namespace crossbind {\n"
   "inline bool claimRegistration(const std::string &key) {\n"
   "  static std::set<std::string> claimed;\n"
@@ -501,6 +515,33 @@ static const char *REGISTRATION_RUNTIME =
   "}\n"
   "inline bool claimFunction(const char *name, int arity) {\n"
   "  return claimRegistration(std::string(\"function \") + name + \"/\" + std::to_string(arity));\n"
+  "}\n"
+  "template<typename M> struct MemberOf;\n"
+  "template<typename C, typename T> struct MemberOf<T C::*> { using Class = C; using Type = T; };\n"
+  "template<typename T> constexpr bool isFieldNumber = std::is_arithmetic_v<T> && !std::is_same_v<T, long double>\n"
+  "  && !std::is_same_v<T, wchar_t> && !std::is_same_v<T, char16_t> && !std::is_same_v<T, char32_t>;\n"
+  "template<auto M, bool Instance, typename Builder> void bindPointerField(const Builder &cls, const char *name);\n"
+  "template<auto M, bool Instance, typename Builder> void bindField(const Builder &cls, const char *name) {\n"
+  "  using C = typename MemberOf<decltype(M)>::Class;\n"
+  "  using T = typename MemberOf<decltype(M)>::Type;\n"
+  "  using U = std::remove_cv_t<T>;\n"
+  "  if constexpr (isFieldNumber<U> || std::is_same_v<U, std::string>) {\n"
+  "    cls.property(name, M);\n"
+  "  } else if constexpr (std::is_enum_v<U>) {\n"
+  "    using I = std::underlying_type_t<U>;\n"
+  "    if constexpr (std::is_const_v<T>) cls.property(name, +[](const C &s) { return static_cast<I>(s.*M); });\n"
+  "    else cls.property(name, +[](const C &s) { return static_cast<I>(s.*M); }, +[](C &s, I v) { s.*M = static_cast<U>(v); });\n"
+  "  } else if constexpr (std::is_pointer_v<U> && !std::is_function_v<std::remove_pointer_t<U>>) {\n"
+  "    bindPointerField<M, Instance>(cls, name);\n"
+  "  }\n"
+  "}\n"
+  "template<typename T> void bindConstant(const char *name, const T &value) {\n"
+  "  using U = std::decay_t<T>;\n"
+  "  [[maybe_unused]] auto claim = [name] { return claimRegistration(std::string(\"name \") + name); };\n"
+  "  if constexpr (std::is_same_v<U, char *> || std::is_same_v<U, const char *>) { if (value && claim()) emscripten::constant(name, std::string(value)); }\n"
+  "  else if constexpr (std::is_same_v<U, bool>) { if (claim()) emscripten::constant(name, value); }\n"
+  "  else if constexpr (std::is_enum_v<U>) { if (claim()) emscripten::constant(name, static_cast<double>(static_cast<std::underlying_type_t<U>>(value))); }\n"
+  "  else if constexpr (std::is_arithmetic_v<U>) { if (claim()) emscripten::constant(name, static_cast<double>(value)); }\n"
   "}\n"
   "}\n\n";
 
@@ -517,8 +558,17 @@ static const char *REGISTRATION_RUNTIME =
 // from allocPointer stands in for any T** and remembers T once C code writes through it. Owned buffers carry their
 // size, so the read and write helpers stay in bounds, and keep alive the handles written into them. A pointer C
 // returns carries no size: reads and writes through it trust the index, as C does. readBytes and writeBytes carry
-// one byte per UTF-16 code unit, the only string form both embind runtimes keep byte for byte. A std::string behind
-// a pointer is a handle from allocString, read back with readString.
+// one byte per UTF-16 code unit, the only string form both embind runtimes keep byte for byte. readBuffer and
+// writeBuffer copy bytes to a new Uint8Array and from any ArrayBuffer or view of one: a view of wasm memory would
+// dangle once the heap grows, so both runtimes copy. A std::string behind a pointer is a handle from allocString,
+// read back with readString. A pointer field reads as an instance through a shared_ptr that owns nothing, as a returned
+// pointer does: the pointee stays the library's, and an instance kept after the library frees it dangles.
+// On a jsi host (no __EMSCRIPTEN__) a C string and a JS function passed as a C callback cross as the jsi::Value itself,
+// because every emval step is a call into JS there; a pointer handle takes the val path. The functions C holds belong to
+// the runtime (jsi runtime data, React Native 0.81 or newer) and are released with it: the thread that passed them keeps
+// only a weak reference, so C calling on another thread or after the runtime went away finds none. A callback whose
+// arguments and result are numbers, booleans or strings is called directly; the others go through emval, which converts
+// handles.
 // A JS function passed as a C callback lives in a slot of the thread that passed it: C must call it on that thread
 // (JS values cannot cross threads on either runtime), and a released slot goes to the next function passed, so JS
 // releases a callback only after C stops calling it.
@@ -577,7 +627,6 @@ static const char *POINTER_RUNTIME =
   "  if constexpr (isRawPointee<Q>) return p;\n"
   "  else return toHandle(p);\n"
   "}\n"
-  "template<typename Q> using JsCString = emscripten::val;\n"
   "struct CStringArg {\n"
   "  bool isText = false;\n"
   "  std::string text;\n"
@@ -588,7 +637,7 @@ static const char *POINTER_RUNTIME =
   "template<typename Q> CStringArg fromJsCString(const emscripten::val &value) {\n"
   "  CStringArg arg;\n"
   "  if (value.isNull() || value.isUndefined()) return arg;\n"
-  "  if (value.typeOf().as<std::string>() == \"string\") {\n"
+  "  if (value.isString()) {\n"
   "    arg.isText = true;\n"
   "    arg.text = value.as<std::string>();\n"
   "  } else if (value.instanceof(emscripten::val::module_property(\"NativePointer\"))) {\n"
@@ -599,7 +648,25 @@ static const char *POINTER_RUNTIME =
   "  }\n"
   "  return arg;\n"
   "}\n"
+  "#ifdef __EMSCRIPTEN__\n"
+  "template<typename Q> using JsCString = emscripten::val;\n"
   "inline emscripten::val toJsCString(const char *text) { return text ? emscripten::val(std::string(text)) : emscripten::val::null(); }\n"
+  "#else\n"
+  "template<typename Q> using JsCString = facebook::jsi::Value;\n"
+  "template<typename Q> CStringArg fromJsCString(const facebook::jsi::Value &value) {\n"
+  "  facebook::jsi::Runtime &runtime = *emscripten::jsRuntime;\n"
+  "  if (value.isNull() || value.isUndefined()) return CStringArg();\n"
+  "  if (!value.isString()) return fromJsCString<Q>(emscripten::val(facebook::jsi::Value(runtime, value)));\n"
+  "  CStringArg arg;\n"
+  "  arg.isText = true;\n"
+  "  arg.text = value.getString(runtime).utf8(runtime);\n"
+  "  return arg;\n"
+  "}\n"
+  "inline facebook::jsi::Value toJsCString(const char *text) {\n"
+  "  if (!text) return facebook::jsi::Value::null();\n"
+  "  return facebook::jsi::String::createFromUtf8(*emscripten::jsRuntime, reinterpret_cast<const uint8_t *>(text), std::strlen(text));\n"
+  "}\n"
+  "#endif\n"
   "template<typename Q> using JsStructPointer = std::conditional_t<isRawPointee<Q>, emscripten::val, PointerHandle>;\n"
   "template<typename Q> Q *fromJsStruct(const PointerHandle &p) { return fromJs<Q>(p); }\n"
   "template<typename Q> Q *fromJsStruct(const emscripten::val &value) {\n"
@@ -607,13 +674,29 @@ static const char *POINTER_RUNTIME =
   "  if (value.instanceof(emscripten::val::module_property(\"NativePointer\"))) return fromJs<Q>(value.as<PointerHandle>());\n"
   "  return value.as<Q *>(emscripten::allow_raw_pointers());\n"
   "}\n"
-  "template<typename T> constexpr bool isFunctionPointer = std::is_pointer_v<T> && std::is_function_v<std::remove_pointer_t<T>>;\n"
-  "template<typename F> using JsCallback = emscripten::val;\n"
-  "inline constexpr size_t callbackSlotCount = 64;\n"
-  "inline std::array<std::optional<emscripten::val>, callbackSlotCount> &callbackSlots() {\n"
-  "  thread_local std::array<std::optional<emscripten::val>, callbackSlotCount> slots;\n"
-  "  return slots;\n"
+  "template<typename T> std::shared_ptr<T> fieldView(T *pointer) { return std::shared_ptr<T>(pointer, [](T *) {}); }\n"
+  "template<typename P> P fieldFromJs(const emscripten::val &value) {\n"
+  "  using Q = std::remove_pointer_t<P>;\n"
+  "  if constexpr (isRawPointee<std::remove_cv_t<Q>>) return fromJsStruct<Q>(value);\n"
+  "  else return value.isNull() || value.isUndefined() ? nullptr : fromJs<Q>(value.as<PointerHandle>());\n"
   "}\n"
+  "template<auto M, bool Instance, typename Builder> void bindPointerField(const Builder &cls, const char *name) {\n"
+  "  using C = typename MemberOf<decltype(M)>::Class;\n"
+  "  using T = typename MemberOf<decltype(M)>::Type;\n"
+  "  auto read = +[](const C &s) {\n"
+  "    if constexpr (Instance) return fieldView(s.*M);\n"
+  "    else return toHandle(s.*M);\n"
+  "  };\n"
+  "  if constexpr (std::is_const_v<T>) cls.property(name, read);\n"
+  "  else cls.property(name, read, +[](C &s, emscripten::val v) { s.*M = fieldFromJs<std::remove_cv_t<T>>(v); });\n"
+  "}\n"
+  "template<typename T> constexpr bool isFunctionPointer = std::is_pointer_v<T> && std::is_function_v<std::remove_pointer_t<T>>;\n"
+  "#ifdef __EMSCRIPTEN__\n"
+  "template<typename F> using JsCallback = emscripten::val;\n"
+  "#else\n"
+  "template<typename F> using JsCallback = facebook::jsi::Value;\n"
+  "#endif\n"
+  "inline constexpr size_t callbackSlotCount = 64;\n"
   "template<typename A> auto callbackArgument(std::remove_reference_t<A> &value) {\n"
   "  using U = std::remove_cv_t<std::remove_reference_t<A>>;\n"
   "  if constexpr (std::is_same_v<U, const char *>) return toJsCString(value);\n"
@@ -621,6 +704,80 @@ static const char *POINTER_RUNTIME =
   "  else if constexpr (std::is_enum_v<U>) return static_cast<std::underlying_type_t<U>>(value);\n"
   "  else if constexpr (std::is_class_v<U> || std::is_union_v<U>) return toHandle(&value);\n"
   "  else return U(value);\n"
+  "}\n"
+  "#ifndef __EMSCRIPTEN__\n"
+  "struct RuntimeCallbacks {\n"
+  "  std::array<std::optional<facebook::jsi::Function>, callbackSlotCount> functions;\n"
+  "};\n"
+  "struct RuntimeCallbacksCache {\n"
+  "  facebook::jsi::Runtime *runtime = nullptr;\n"
+  "  std::weak_ptr<RuntimeCallbacks> callbacks;\n"
+  "};\n"
+  "inline RuntimeCallbacksCache &runtimeCallbacksCache() {\n"
+  "  thread_local RuntimeCallbacksCache cache;\n"
+  "  return cache;\n"
+  "}\n"
+  "inline std::shared_ptr<RuntimeCallbacks> cachedRuntimeCallbacks() {\n"
+  "  RuntimeCallbacksCache &cache = runtimeCallbacksCache();\n"
+  "  return cache.runtime == emscripten::jsRuntime ? cache.callbacks.lock() : nullptr;\n"
+  "}\n"
+  "inline RuntimeCallbacks &runtimeCallbacks(facebook::jsi::Runtime &runtime) {\n"
+  "  static constexpr facebook::jsi::UUID key{0x63627263, 0x616c, 0x6c62, 0x8163, 0x6b73636272ull};\n"
+  "  std::shared_ptr<RuntimeCallbacks> callbacks = cachedRuntimeCallbacks();\n"
+  "  if (!callbacks) {\n"
+  "    callbacks = std::static_pointer_cast<RuntimeCallbacks>(runtime.getRuntimeData(key));\n"
+  "    if (!callbacks) {\n"
+  "      callbacks = std::make_shared<RuntimeCallbacks>();\n"
+  "      runtime.setRuntimeData(key, callbacks);\n"
+  "    }\n"
+  "    runtimeCallbacksCache() = {&runtime, callbacks};\n"
+  "  }\n"
+  "  return *callbacks;\n"
+  "}\n"
+  "template<typename T, bool = std::is_enum_v<T>> struct WireOf { using type = T; };\n"
+  "template<typename T> struct WireOf<T, true> { using type = std::underlying_type_t<T>; };\n"
+  "template<typename T> constexpr bool isPlainWire = std::is_same_v<T, bool> || std::is_same_v<T, char> || std::is_same_v<T, signed char> || std::is_same_v<T, unsigned char> || std::is_same_v<T, short> || std::is_same_v<T, unsigned short> || std::is_same_v<T, int> || std::is_same_v<T, unsigned int> || std::is_same_v<T, float> || std::is_same_v<T, double>;\n"
+  "template<typename T> constexpr bool isDirectCallbackValue = isPlainWire<T> || std::is_same_v<T, facebook::jsi::Value>;\n"
+  "template<typename T> facebook::jsi::Value callbackValue(facebook::jsi::Runtime &runtime, const T &value) {\n"
+  "  if constexpr (std::is_same_v<T, facebook::jsi::Value>) return facebook::jsi::Value(runtime, value);\n"
+  "  else return emscripten::internal::BindingType<T>::toWireType2(runtime, value);\n"
+  "}\n"
+  "template<typename W> bool fitsPlainWire(const facebook::jsi::Value &result) {\n"
+  "  if constexpr (std::is_same_v<W, bool>) return result.isBool();\n"
+  "  else if constexpr (std::is_floating_point_v<W>) return result.isNumber();\n"
+  "  else return result.isNumber() && result.getNumber() >= std::numeric_limits<W>::min() && result.getNumber() <= std::numeric_limits<W>::max();\n"
+  "}\n"
+  "template<typename R, typename... A> R invokeCallback(size_t slot, A... args) {\n"
+  "  std::shared_ptr<RuntimeCallbacks> callbacks = cachedRuntimeCallbacks();\n"
+  "  if (!callbacks || !callbacks->functions[slot]) {\n"
+  "    std::fprintf(stderr, \"crossbind: C called a callback that JS released, or called it from another thread than the one that passed it\\n\");\n"
+  "    return R();\n"
+  "  }\n"
+  "  facebook::jsi::Runtime &runtime = *emscripten::jsRuntime;\n"
+  "  const facebook::jsi::Function &function = *callbacks->functions[slot];\n"
+  "  constexpr bool isDirect = (isDirectCallbackValue<decltype(callbackArgument<A>(std::declval<std::remove_reference_t<A> &>()))> && ...) && (std::is_void_v<R> || std::is_arithmetic_v<R> || std::is_enum_v<R>);\n"
+  "  if constexpr (isDirect) {\n"
+  "    facebook::jsi::Value result = function.call(runtime, callbackValue(runtime, callbackArgument<A>(args))...);\n"
+  "    if constexpr (std::is_void_v<R>) return;\n"
+  "    else {\n"
+  "      using W = typename WireOf<R>::type;\n"
+  "      if constexpr (isPlainWire<W>) {\n"
+  "        if (fitsPlainWire<W>(result)) return static_cast<R>(emscripten::internal::BindingType<W>::fromWireType2(runtime, result));\n"
+  "      }\n"
+  "      return static_cast<R>(emscripten::val(std::move(result)).as<W>());\n"
+  "    }\n"
+  "  } else {\n"
+  "    emscripten::val result = emscripten::val(facebook::jsi::Value(runtime, function))(callbackArgument<A>(args)...);\n"
+  "    if constexpr (std::is_void_v<R>) return;\n"
+  "    else if constexpr (std::is_pointer_v<R>) return result.isNull() || result.isUndefined() ? nullptr : fromJs<std::remove_pointer_t<R>>(result.as<PointerHandle>());\n"
+  "    else if constexpr (std::is_enum_v<R>) return static_cast<R>(result.as<std::underlying_type_t<R>>());\n"
+  "    else return result.as<R>();\n"
+  "  }\n"
+  "}\n"
+  "#else\n"
+  "inline std::array<std::optional<emscripten::val>, callbackSlotCount> &callbackSlots() {\n"
+  "  thread_local std::array<std::optional<emscripten::val>, callbackSlotCount> slots;\n"
+  "  return slots;\n"
   "}\n"
   "template<typename R, typename... A> R invokeCallback(size_t slot, A... args) {\n"
   "  std::optional<emscripten::val> &function = callbackSlots()[slot];\n"
@@ -634,6 +791,7 @@ static const char *POINTER_RUNTIME =
   "  else if constexpr (std::is_enum_v<R>) return static_cast<R>(result.as<std::underlying_type_t<R>>());\n"
   "  else return result.as<R>();\n"
   "}\n"
+  "#endif\n"
   "template<typename F> struct Callback { static constexpr bool isSupported = false; };\n"
   "template<typename R, typename... A> struct Callback<R (*)(A...)> {\n"
   "  static constexpr bool isSupported = true;\n"
@@ -641,6 +799,40 @@ static const char *POINTER_RUNTIME =
   "};\n"
   "template<typename F, size_t... I> constexpr std::array<F, sizeof...(I)> callbackTable(std::index_sequence<I...>) { return {{&Callback<F>::template call<I>...}}; }\n"
   "template<typename F> inline constexpr std::array<F, callbackSlotCount> trampolines = callbackTable<F>(std::make_index_sequence<callbackSlotCount>());\n"
+  "#ifndef __EMSCRIPTEN__\n"
+  "inline size_t claimCallbackSlot(facebook::jsi::Runtime &runtime, const facebook::jsi::Object &function) {\n"
+  "  RuntimeCallbacks &callbacks = runtimeCallbacks(runtime);\n"
+  "  for (size_t i = 0; i < callbackSlotCount; ++i) {\n"
+  "    if (callbacks.functions[i] && facebook::jsi::Object::strictEquals(runtime, *callbacks.functions[i], function)) return i;\n"
+  "  }\n"
+  "  for (size_t i = 0; i < callbackSlotCount; ++i) {\n"
+  "    if (!callbacks.functions[i]) {\n"
+  "      callbacks.functions[i] = function.getFunction(runtime);\n"
+  "      return i;\n"
+  "    }\n"
+  "  }\n"
+  "  throw std::length_error(\"crossbind: every callback slot holds a function; releaseCallback frees the ones C no longer calls\");\n"
+  "}\n"
+  "template<typename F> F fromJsCallback(const facebook::jsi::Value &value) {\n"
+  "  facebook::jsi::Runtime &runtime = *emscripten::jsRuntime;\n"
+  "  if (value.isNull() || value.isUndefined()) return nullptr;\n"
+  "  if (!value.isObject() || !value.getObject(runtime).isFunction(runtime)) return fromJs<std::remove_pointer_t<F>>(emscripten::val(facebook::jsi::Value(runtime, value)).as<PointerHandle>());\n"
+  "  if constexpr (Callback<F>::isSupported) return trampolines<F>[claimCallbackSlot(runtime, value.getObject(runtime))];\n"
+  "  else throw std::invalid_argument(\"crossbind: a JS function cannot stand in for a variadic C callback\");\n"
+  "}\n"
+  "inline bool releaseCallback(const facebook::jsi::Value &function) {\n"
+  "  facebook::jsi::Runtime &runtime = *emscripten::jsRuntime;\n"
+  "  if (!function.isObject()) return false;\n"
+  "  facebook::jsi::Object object = function.getObject(runtime);\n"
+  "  for (std::optional<facebook::jsi::Function> &slot : runtimeCallbacks(runtime).functions) {\n"
+  "    if (slot && facebook::jsi::Object::strictEquals(runtime, *slot, object)) {\n"
+  "      slot.reset();\n"
+  "      return true;\n"
+  "    }\n"
+  "  }\n"
+  "  return false;\n"
+  "}\n"
+  "#else\n"
   "inline size_t claimCallbackSlot(const emscripten::val &function) {\n"
   "  std::array<std::optional<emscripten::val>, callbackSlotCount> &slots = callbackSlots();\n"
   "  for (size_t i = 0; i < callbackSlotCount; ++i) {\n"
@@ -669,6 +861,7 @@ static const char *POINTER_RUNTIME =
   "  }\n"
   "  return false;\n"
   "}\n"
+  "#endif\n"
   "template<typename T> constexpr bool isPassedByAddress = !IsComplete<T>::value || std::is_class_v<T> || std::is_union_v<T>;\n"
   "template<typename T> struct IsSharedPtr : std::false_type {};\n"
   "template<typename T> struct IsSharedPtr<std::shared_ptr<T>> : std::true_type {};\n"
@@ -704,7 +897,7 @@ static const char *POINTER_RUNTIME =
   "  if (!p) throw std::invalid_argument(\"crossbind: a null pointer cannot be passed where a non-null pointer is required\");\n"
   "  return std::remove_cv_t<Q>(p);\n"
   "}\n"
-  "template<typename T> T fromJsArg(JsArg<T> value) {\n"
+  "template<typename T> T fromJsArg(const JsArg<T> &value) {\n"
   "  if constexpr (isFunctionPointer<T>) return fromJsCallback<T>(value);\n"
   "  else if constexpr (std::is_pointer_v<T>) return fromJsStruct<std::remove_pointer_t<T>>(value);\n"
   "  else return value;\n"
@@ -869,6 +1062,49 @@ static const char *POINTER_RUNTIME =
   "  }\n"
   "  std::copy(bytes.begin(), bytes.end(), reinterpret_cast<unsigned char *>(p->address));\n"
   "}\n"
+  "#ifdef __EMSCRIPTEN__\n"
+  "inline emscripten::val readBuffer(PointerHandle p, int length) {\n"
+  "  size_t size = checkedSize(length, \"readBuffer\");\n"
+  "  checkedOffset(p, \"readBuffer\", 0, size);\n"
+  "  return emscripten::val(emscripten::typed_memory_view(size, reinterpret_cast<const unsigned char *>(p->address))).call<emscripten::val>(\"slice\");\n"
+  "}\n"
+  "inline void writeBuffer(PointerHandle p, const emscripten::val &bytes) {\n"
+  "  emscripten::val arrayBuffer = emscripten::val::global(\"ArrayBuffer\");\n"
+  "  emscripten::val uint8Array = emscripten::val::global(\"Uint8Array\");\n"
+  "  emscripten::val source = emscripten::val::undefined();\n"
+  "  if (bytes.instanceof(arrayBuffer)) source = uint8Array.new_(bytes);\n"
+  "  else if (arrayBuffer.call<bool>(\"isView\", bytes)) source = uint8Array.new_(bytes[\"buffer\"], bytes[\"byteOffset\"], bytes[\"byteLength\"]);\n"
+  "  else throw std::invalid_argument(\"crossbind: writeBuffer takes an ArrayBuffer or a view of one\");\n"
+  "  size_t size = source[\"length\"].as<size_t>();\n"
+  "  checkedOffset(p, \"writeBuffer\", 0, size);\n"
+  "  checkWritable(p, \"writeBuffer\");\n"
+  "  emscripten::val(emscripten::typed_memory_view(size, reinterpret_cast<unsigned char *>(p->address))).call<void>(\"set\", source);\n"
+  "}\n"
+  "#else\n"
+  "inline facebook::jsi::Value readBuffer(PointerHandle p, int length) {\n"
+  "  size_t size = checkedSize(length, \"readBuffer\");\n"
+  "  checkedOffset(p, \"readBuffer\", 0, size);\n"
+  "  facebook::jsi::Runtime &runtime = *emscripten::jsRuntime;\n"
+  "  facebook::jsi::Object bytes = runtime.global().getPropertyAsFunction(runtime, \"Uint8Array\").callAsConstructor(runtime, static_cast<double>(size)).getObject(runtime);\n"
+  "  if (size) std::memcpy(bytes.getPropertyAsObject(runtime, \"buffer\").getArrayBuffer(runtime).data(runtime), reinterpret_cast<const void *>(p->address), size);\n"
+  "  return bytes;\n"
+  "}\n"
+  "inline void writeBuffer(PointerHandle p, const facebook::jsi::Value &bytes) {\n"
+  "  facebook::jsi::Runtime &runtime = *emscripten::jsRuntime;\n"
+  "  bool isBuffer = bytes.isObject() && bytes.getObject(runtime).isArrayBuffer(runtime);\n"
+  "  bool isView = !isBuffer && bytes.isObject() && runtime.global().getPropertyAsObject(runtime, \"ArrayBuffer\").getPropertyAsFunction(runtime, \"isView\").call(runtime, bytes).getBool();\n"
+  "  if (!isBuffer && !isView) throw std::invalid_argument(\"crossbind: writeBuffer takes an ArrayBuffer or a view of one\");\n"
+  "  facebook::jsi::Object object = bytes.getObject(runtime);\n"
+  "  facebook::jsi::Object buffer = isBuffer ? bytes.getObject(runtime) : object.getPropertyAsObject(runtime, \"buffer\");\n"
+  "  if (!buffer.isArrayBuffer(runtime)) throw std::invalid_argument(\"crossbind: writeBuffer cannot read a SharedArrayBuffer\");\n"
+  "  facebook::jsi::ArrayBuffer data = buffer.getArrayBuffer(runtime);\n"
+  "  size_t offset = isView ? static_cast<size_t>(object.getProperty(runtime, \"byteOffset\").getNumber()) : 0;\n"
+  "  size_t size = isView ? static_cast<size_t>(object.getProperty(runtime, \"byteLength\").getNumber()) : data.size(runtime);\n"
+  "  checkedOffset(p, \"writeBuffer\", 0, size);\n"
+  "  checkWritable(p, \"writeBuffer\");\n"
+  "  if (size) std::memcpy(reinterpret_cast<void *>(p->address), data.data(runtime) + offset, size);\n"
+  "}\n"
+  "#endif\n"
   "inline void registerPointerRuntime() {\n"
   "  emscripten::class_<NativePointer>(\"NativePointer\").smart_ptr<PointerHandle>(\"NativePointer\");\n"
   "  emscripten::function(\"cstring\", &cstring);\n"
@@ -881,6 +1117,8 @@ static const char *POINTER_RUNTIME =
   "  emscripten::function(\"writeNumberAt\", &writeNumberAt);\n"
   "  emscripten::function(\"readBytes\", &readBytes);\n"
   "  emscripten::function(\"writeBytes\", &writeBytes);\n"
+  "  emscripten::function(\"readBuffer\", &readBuffer);\n"
+  "  emscripten::function(\"writeBuffer\", &writeBuffer);\n"
   "  emscripten::function(\"releaseCallback\", &releaseCallback);\n"
   "  emscripten::function(\"allocString\", &allocString);\n"
   "  emscripten::function(\"readString\", &readString);\n"
@@ -964,7 +1202,7 @@ static bool claimOverload(Node *n, const char *kind, const_String_or_char_ptr sc
   String *key = NewStringf("%s %s %s %d", kind, scope, jsName, arity);
   bool claimed = !Getattr(boundOverloads, key);
   if (claimed) Setattr(boundOverloads, key, "1");
-  else Swig_warning(WARN_LANG_OVERLOAD_IGNORED, Getfile(n), Getline(n), "embind cannot bind another overload of %s taking %d arguments, ignored.\n", jsName, arity);
+  else warnSkipped(n, WARN_LANG_OVERLOAD_IGNORED, NewStringf("embind cannot bind another overload of %s taking %d arguments, ignored.", jsName, arity));
   Delete(key);
   return claimed;
 }
@@ -1032,6 +1270,7 @@ int EMBIND::top(Node *n) {
   f_cxx_header = NewString("");
   f_cxx_wrapper = NewString("");
   f_cxx_functions = NewString("");
+  skippedBindings = NewString("");
   exports = NewString("");
   usesPointerRuntime = false;
   deferredBlocks = NewString("");
@@ -1054,13 +1293,21 @@ int EMBIND::top(Node *n) {
   Printf(f_cxx_wrapper, "}\n");
   if (usesPointerRuntime) {
     Printf(f_cxx_header, "%s", POINTER_RUNTIME);
-    Printf(exports, ", \"NativePointer\", \"cstring\", \"allocBuffer\", \"allocPointer\", \"readCString\", \"readPointerAt\", \"writePointerAt\", \"readNumberAt\", \"writeNumberAt\", \"readBytes\", \"writeBytes\", \"releaseCallback\", \"allocString\", \"readString\"");
+    Printf(exports, ", \"NativePointer\", \"cstring\", \"allocBuffer\", \"allocPointer\", \"readCString\", \"readPointerAt\", \"writePointerAt\", \"readNumberAt\", \"writeNumberAt\", \"readBytes\", \"writeBytes\", \"readBuffer\", \"writeBuffer\", \"releaseCallback\", \"allocString\", \"readString\"");
   }
 
   Printf(exports, "]\n");
   Replace(exports, ", ", "", DOH_REPLACE_FIRST);
 
   Dump(exports, f_exports);
+  String *warningsFilename = NewStringf("%s.warnings", cxx_filename);
+  File *f_warnings = NewFile(warningsFilename, "w", SWIG_output_files());
+  if (f_warnings) {
+    Dump(skippedBindings, f_warnings);
+    Delete(f_warnings);
+  }
+  Delete(warningsFilename);
+  Delete(skippedBindings);
   Dump(f_cxx_header, f_runtime);
   Dump(f_cxx_wrapper, f_runtime);
   Dump(f_runtime, f_begin);
@@ -1185,13 +1432,18 @@ int EMBIND::classHandler(Node *n) {
     List *namespaces = enclosingNamespaces(n);
     for (Iterator ns = First(namespaces); ns.item; ns = Next(ns)) Printf(f_cxx_wrapper, "namespace %s { ", ns.item);
     if (Len(namespaces) != 0) Printf(f_cxx_wrapper, "\n");
-    // The claim spells the type through typeid: crossbind finds the class_ opener by its `>("Name")`.
-    Printf(f_cxx_wrapper, "EMSCRIPTEN_BINDINGS(%s) {\n  if (crossbind::claimType(typeid(%s), \"%s\")) emscripten::class_<%s%s>(\"%s\")\n", name, nsname, name, nsname, super, name);
+    // The claim spells the type through typeid. Fields bind after the chain through the named class_, so the compiler
+    // decides whether each one binds.
+    Printf(f_cxx_wrapper, "EMSCRIPTEN_BINDINGS(%s) {\n  if (crossbind::claimType(typeid(%s), \"%s\")) {\n  const emscripten::class_<%s%s> cls(\"%s\");\n  static_cast<void>(cls\n", name, nsname, name, nsname, super, name);
     Printf(exports, ", \"%s\"", name);
     if (Getattr(n, "feature:shared_ptr")) Printf(f_cxx_wrapper, "    .smart_ptr<std::shared_ptr<%s>>(\"%s\")\n", nsname, name);
     if (isListener) Printf(f_cxx_wrapper, "    .allow_subclass<%sWrapper, std::shared_ptr<%sWrapper>>(\"%sWrapper\", \"%sWrapperSharedPtr\")\n", name, name, name, name);
+    String *outerFields = fieldBindings;
+    fieldBindings = NewString("");
     Language::classHandler(n);
-    Printf(f_cxx_wrapper, "  ;\n}\n");
+    Printf(f_cxx_wrapper, "  );\n%s  }\n}\n", fieldBindings);
+    Delete(fieldBindings);
+    fieldBindings = outerFields;
     for (Iterator ns = First(namespaces); ns.item; ns = Next(ns)) Printf(f_cxx_wrapper, "}");
     Printf(f_cxx_wrapper, Len(namespaces) != 0 ? "\n\n" : "\n");
     Printf(f_cxx_wrapper, "%s", deferredBlocks);
@@ -1216,8 +1468,32 @@ int EMBIND::memberfunctionHandler(Node *n) {
   return Language::memberfunctionHandler(n);
 }
 
+// crossbind::bindField decides from the C++ type whether and how a field binds. A bit-field and a reference have no member
+// pointer, so they are left out here. A pointer to a struct of this module with a shared_ptr holder reads as an instance;
+// a pointer, or a type SWIG cannot resolve, needs the pointer runtime.
 int EMBIND::membervariableHandler(Node *n) {
-  return Language::membervariableHandler(n);
+  Node *cls = getCurrentClass();
+  String *symname = Getattr(n, "sym:name");
+  String *member = Getattr(n, "name");
+  SwigType *type = Getattr(n, "type");
+  if (!cls || !fieldBindings || Extend || !symname || !member || !type || Getattr(n, "bitfield") || Swig_storage_isstatic(n)) return SWIG_OK;
+  SwigType *resolved = SwigType_typedef_resolve_all(type);
+  SwigType *bare = SwigType_strip_qualifiers(resolved);
+  if (!SwigType_isreference(bare) && !SwigType_isrvalue_reference(bare)) {
+    bool instance = false;
+    if (SwigType_ispointer(bare)) {
+      SwigType *pointee = Copy(bare);
+      SwigType_del_pointer(pointee);
+      Node *pointeeClass = !SwigType_ispointer(pointee) && !SwigType_isconst(pointee) ? classLookup(pointee) : 0;
+      instance = pointeeClass && Getattr(pointeeClass, "feature:shared_ptr");
+      Delete(pointee);
+    }
+    if (SwigType_ispointer(bare) || (SwigType_type(bare) == T_USER && !classLookup(bare))) usesPointerRuntime = true;
+    Printf(fieldBindings, "  crossbind::bindField<&%s::%s, %s>(cls, \"%s\");\n", Getattr(cls, "name"), member, instance ? "true" : "false", symname);
+  }
+  Delete(bare);
+  Delete(resolved);
+  return SWIG_OK;
 }
 
 static bool isStandardStream(const SwigType *t) {
@@ -1262,11 +1538,11 @@ static const char *unbindableReason(Node *n) {
 
 int EMBIND::functionWrapper(Node *n) {
   if (takesVariadicArguments(Getattr(n, "parms"))) {
-    Swig_warning(WARN_LANG_VARARGS, Getfile(n), Getline(n), "Variable length arguments are not supported by embind, %s skipped.\n", Getattr(n, "name"));
+    warnSkipped(n, WARN_LANG_VARARGS, NewStringf("Variable length arguments are not supported by embind, %s skipped.", Getattr(n, "name")));
     return SWIG_OK;
   }
   if (const char *reason = unbindableReason(n)) {
-    Swig_warning(WARN_LANG_IDENTIFIER, Getfile(n), Getline(n), "%s %s, so embind cannot bind it; skipped.\n", Getattr(n, "name"), reason);
+    warnSkipped(n, WARN_LANG_IDENTIFIER, NewStringf("%s %s, so embind cannot bind it; skipped.", Getattr(n, "name"), reason));
     return SWIG_OK;
   }
   String   *bname   = Getattr(n, "sym:name");
@@ -1295,7 +1571,6 @@ int EMBIND::functionWrapper(Node *n) {
   String *name = Getattr(n, "name");
   String *name2 = Getattr(n, "memberfunctionHandler:sym:name");
   String *staticName = Getattr(n, "staticmemberfunctionHandler:name");
-  String *variableName = Getattr(n, "membervariableHandler:sym:name");
   String *type = Getattr(n, "nodeType");
   String *view = Getattr(n, "view");
 
@@ -1479,13 +1754,11 @@ int EMBIND::functionWrapper(Node *n) {
       Printf(params, ", %s", pTypeAll);
     }
 
-    if (Len(variableName) != 0) {
-
-    } else if (Len(staticName) != 0 && Strcmp(view, "destructorHandler") != 0) {
+    if (Len(staticName) != 0 && Strcmp(view, "destructorHandler") != 0) {
       bool isJSPI = strstr(Char(staticName), "_JSPI") != nullptr;
       // A JS class is a function, and its length, name and prototype properties cannot be replaced.
       if (Equal(staticName, "length") || Equal(staticName, "name") || Equal(staticName, "prototype")) {
-        Swig_warning(WARN_LANG_IDENTIFIER, Getfile(n), Getline(n), "Static method %s cannot become a property of a JavaScript class, skipped.\n", staticName);
+        warnSkipped(n, WARN_LANG_IDENTIFIER, NewStringf("Static method %s cannot become a property of a JavaScript class, skipped.", staticName));
         return SWIG_OK;
       }
       if (!claimOverload(n, "static", className, staticName, parms)) return SWIG_OK;
@@ -1549,11 +1822,61 @@ int EMBIND::functionWrapper(Node *n) {
   return SWIG_OK;
 }
 
+// A number, bool, enum or C string has a value JS can hold; a pointer, a struct or a table of strings does not.
+static bool isBindableConstant(SwigType *type) {
+  SwigType *resolved = SwigType_typedef_resolve_all(type);
+  SwigType *bare = SwigType_strip_qualifiers(resolved);
+  int dimensions = SwigType_isarray(bare) ? SwigType_array_ndim(bare) : 0;
+  if (dimensions) Delete(SwigType_pop_arrays(bare));
+  int code = SwigType_type(bare);
+  bool bindable = dimensions ? dimensions == 1 && code == T_CHAR : SwigType_isenum(bare) != 0;
+  if (!dimensions) {
+    switch (code) {
+      case T_BOOL: case T_SCHAR: case T_UCHAR: case T_SHORT: case T_USHORT: case T_INT: case T_UINT: case T_LONG: case T_ULONG:
+      case T_LONGLONG: case T_ULONGLONG: case T_FLOAT: case T_DOUBLE: case T_CHAR: case T_STRING:
+        bindable = true;
+        break;
+      default:
+        break;
+    }
+  }
+  Delete(bare);
+  Delete(resolved);
+  return bindable;
+}
+
+// Constants bind only when the interface asks for them by name, which crossbind does for the names the app imports, so a
+// header's thousands of macros cost nothing until one is used. A macro reads as itself where the bridge compiles, so a
+// value that differs by platform follows the target; SWIG's reading stands in where no macro has the name (a %constant).
 int EMBIND::constantWrapper(Node *n) {
+  String *symname = Getattr(n, "sym:name");
+  String *name = Getattr(n, "name");
+  if (!GetFlag(n, "feature:embind:constant") || !symname || !name) return SWIG_OK;
+  if (!isBindableConstant(Getattr(n, "type"))) {
+    warnSkipped(n, WARN_LANG_IDENTIFIER, NewStringf("Constant %s is not a number, bool or string, so embind cannot bind it; skipped.", symname));
+    return SWIG_OK;
+  }
+  Printf(f_cxx_functions, "  crossbind::bindConstant(\"%s\",\n#ifdef %s\n    %s\n#else\n    %s\n#endif\n  );\n", symname, name, name, Getattr(n, "value"));
+  Printf(exports, ", \"%s\"", symname);
   return SWIG_OK;
 }
 
+// A global binds on the same request, and only a const one: its value is read once, when the module starts.
 int EMBIND::variableWrapper(Node *n) {
+  String *symname = Getattr(n, "sym:name");
+  String *name = Getattr(n, "name");
+  SwigType *type = Getattr(n, "type");
+  if (!GetFlag(n, "feature:embind:constant") || !symname || !name || !type) return SWIG_OK;
+  // SWIG keeps constexpr in the storage class, not in the type.
+  String *storage = Getattr(n, "storage");
+  bool isConst = !SwigType_ismutable(type) || (storage && Strstr(storage, "constexpr"));
+  const char *reason = !isConst ? "is not const" : !isBindableConstant(type) ? "is not a number, bool or string" : 0;
+  if (reason) {
+    warnSkipped(n, WARN_LANG_IDENTIFIER, NewStringf("Global %s %s, so embind cannot bind it as a constant; skipped.", symname, reason));
+    return SWIG_OK;
+  }
+  Printf(f_cxx_functions, "  crossbind::bindConstant(\"%s\", %s);\n", symname, name);
+  Printf(exports, ", \"%s\"", symname);
   return SWIG_OK;
 }
 
