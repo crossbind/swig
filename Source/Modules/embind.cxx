@@ -772,7 +772,8 @@ int EMBIND::top(Node *n) {
 
 int EMBIND::classHandler(Node *n) {
   String *name = Getattr(n, "sym:name");
-  String *nsname = Getattr(n, "name");
+  // SWIG spells a %template instance Box<(int)>; C++ reads Box< int >.
+  String *nsname = SwigType_namestr(Getattr(n, "name"));
   String *kind = Getattr(n, "kind");
   String *bases = Getattr(n, "bases");
   String *classType = Getattr(n, "classtype");
@@ -865,7 +866,7 @@ int EMBIND::classHandler(Node *n) {
     if (bases) {
       Node *base = First(bases).item;
       bool isVirtualBase = inheritsVirtually(n, base);
-      Printf(super, isVirtualBase ? ", crossbind::VirtualBase<%s>" : ", emscripten::base<%s>", Getattr(base, "name"));
+      Printf(super, isVirtualBase ? ", crossbind::VirtualBase<%s>" : ", emscripten::base<%s>", SwigType_namestr(Getattr(base, "name")));
       if (isVirtualBase) usesPointerRuntime = true;
     }
 
@@ -937,7 +938,7 @@ int EMBIND::membervariableHandler(Node *n) {
       Delete(pointee);
     }
     if (SwigType_ispointer(bare) || (SwigType_type(bare) == T_USER && !classLookup(bare))) usesPointerRuntime = true;
-    Printf(fieldBindings, "  crossbind::bindField<&%s::%s, %s>(cls, \"%s\");\n", Getattr(cls, "name"), member, instance ? "true" : "false", symname);
+    Printf(fieldBindings, "  crossbind::bindField<&%s::%s, %s>(cls, \"%s\");\n", SwigType_namestr(Getattr(cls, "name")), member, instance ? "true" : "false", symname);
   }
   Delete(bare);
   Delete(resolved);
@@ -961,8 +962,26 @@ static bool isMoveOnlyByValue(const SwigType *t) {
   return !SwigType_ispointer(t) && !SwigType_isreference(t) && returnsMoveOnly(t);
 }
 
-// JS cannot call these, and their bindings do not compile: deleted members, friends declared only inside their class
-// (ordinary lookup cannot find them), move constructors, standard streams, and move-only values passed by value.
+// embind builds a std::unique_ptr argument around the object a JS handle holds, so the call destroys that object and the
+// handle destroys it again: by value, as an rvalue and through a const reference alike. A mutable reference is an
+// out-parameter.
+static bool takesUniquePtr(const SwigType *t) {
+  SwigType *resolved = SwigType_typedef_resolve_all(t);
+  bool isOutParameter = false;
+  if (SwigType_isreference(resolved)) {
+    SwigType_del_reference(resolved);
+    isOutParameter = !SwigType_isconst(resolved);
+  }
+  SwigType *bare = bareType(t);
+  bool result = !isOutParameter && Strncmp(bare, "std::unique_ptr<", 16) == 0;
+  Delete(bare);
+  Delete(resolved);
+  return result;
+}
+
+// JS cannot call these, and their bindings do not compile or free an object twice: deleted members, friends declared
+// only inside their class (ordinary lookup cannot find them), move constructors, standard streams, move-only values
+// passed by value and std::unique_ptr arguments.
 static const char *unbindableReason(Node *n) {
   if (GetFlag(n, "deleted")) return "is deleted";
   String *storage = Getattr(n, "storage");
@@ -980,6 +999,7 @@ static const char *unbindableReason(Node *n) {
   for (Parm *p = parms; p; p = nextSibling(p)) {
     if (isStandardStream(Getattr(p, "type"))) return "takes a standard stream";
     if (isMoveOnlyByValue(Getattr(p, "type"))) return "takes a move-only value by value";
+    if (takesUniquePtr(Getattr(p, "type"))) return "takes a std::unique_ptr";
   }
   return 0;
 }
@@ -1042,9 +1062,11 @@ int EMBIND::functionWrapper(Node *n) {
     parent = parentNode(parent);
     className = Getattr(parent, "name");
   }
+  // className stays SWIG's spelling for type lookups; C++ reads a %template instance as classSpelling.
+  String *classSpelling = className ? SwigType_namestr(className) : NewString("");
 
   if (Len(className) != 0 && actioncodeString.substr(0, 2) == "->") {
-    actioncodeString = std::string(Char(className)) + "::" + actioncodeString.substr(2);
+    actioncodeString = std::string(Char(classSpelling)) + "::" + actioncodeString.substr(2);
   }
 
   String *funcName = NewString(actioncodeString.c_str());
@@ -1145,7 +1167,7 @@ int EMBIND::functionWrapper(Node *n) {
     if (!claimOverload(n, "constructor", className, name, parms)) return SWIG_OK;
     bool isPolymorphic = Getattr(parent, "feature:polymorphic_shared_ptr") != 0;
     if (needsAdapter) {
-      String *callee = NewStringf(isPolymorphic ? "std::make_shared<%s>" : "new %s", className);
+      String *callee = NewStringf(isPolymorphic ? "std::make_shared<%s>" : "new %s", classSpelling);
       if (isPolymorphic) {
         Printf(f_cxx_wrapper, "    .smart_ptr_constructor(\"%s\", %s%s)\n", name, bindingAdapter(n, parms, callee, className), pointerPolicy);
       } else {
@@ -1159,7 +1181,7 @@ int EMBIND::functionWrapper(Node *n) {
         insertRuntime("embind_factory.swg", f_cxx_header);
         isFactoryPrinted = true;
       }
-      Printf(f_cxx_wrapper, "    .smart_ptr_constructor(\"%s\", &crossbind::makeShared<%s%s>%s)\n", name, className, smartPtrParams, pointerPolicy);
+      Printf(f_cxx_wrapper, "    .smart_ptr_constructor(\"%s\", &crossbind::makeShared<%s%s>%s)\n", name, classSpelling, smartPtrParams, pointerPolicy);
     } else {
       // class_::constructor already allows raw pointers; a policy argument would bind to its Callable overload.
       Printf(f_cxx_wrapper, "    .constructor<%s>()\n", constructorParams);
@@ -1227,9 +1249,9 @@ int EMBIND::functionWrapper(Node *n) {
         if (!claimOverload(n, "method", className, name, parms)) return SWIG_OK;
         if (isListener) {
           if (Getattr(n, "abstract")) {
-            Printf(f_cxx_wrapper, "    .function(\"%s\", &%s::%s, emscripten::pure_virtual())\n", name, className, name);
+            Printf(f_cxx_wrapper, "    .function(\"%s\", &%s::%s, emscripten::pure_virtual())\n", name, classSpelling, name);
           } else {
-            Printf(f_cxx_wrapper, "    .function(\"%s\", emscripten::optional_override([](%s& self%s) {\n      return self.%s(%s);\n    }))\n", name, className, params, name, variables);
+            Printf(f_cxx_wrapper, "    .function(\"%s\", emscripten::optional_override([](%s& self%s) {\n      return self.%s(%s);\n    }))\n", name, classSpelling, params, name, variables);
           }
         } else if (needsAdapter || isUsingSameName) {
           String *callee = isExtension(n) ? Copy(funcName) : NewStringf("self->%s", name);
@@ -1240,11 +1262,14 @@ int EMBIND::functionWrapper(Node *n) {
           Printf(f_cxx_wrapper, "    .function(\"%s\", &%s%s)\n", name, funcName, pointerPolicy);
         }
       } else {
-        // A namespaced free function keeps its C++ qualification; its JS export name cannot carry `::`.
-        String *jsName = Swig_scopename_last(name);
+        // A namespaced free function keeps its C++ qualification; its JS export name cannot carry `::`. A %template
+        // instance (larger<(int)>) takes the name %template gives it, and C++ calls it as larger< int >.
+        bool isTemplateInstance = SwigType_istemplate(name);
+        String *jsName = isTemplateInstance ? Copy(Getattr(n, "sym:name")) : Swig_scopename_last(name);
+        String *callee = isTemplateInstance ? SwigType_namestr(name) : Copy(name);
         if (!claimOverload(n, "function", "", jsName, parms)) return SWIG_OK;
         if (needsAdapter || isUsingSameName) {
-          String *registration = NewStringf("    if (crossbind::claimFunction(\"%s\", %d)) emscripten::function(\"%s\", %s%s%s);\n", jsName, bindingArity(parms), jsName, bindingAdapter(n, parms, name, className), isJSPI && !isUsingSameName ? ", emscripten::async()" : "", pointerPolicy);
+          String *registration = NewStringf("    if (crossbind::claimFunction(\"%s\", %d)) emscripten::function(\"%s\", %s%s%s);\n", jsName, bindingArity(parms), jsName, bindingAdapter(n, parms, callee, className), isJSPI && !isUsingSameName ? ", emscripten::async()" : "", pointerPolicy);
           List *namespaces = enclosingNamespaces(n);
           if (Len(namespaces) == 0) {
             Printf(f_cxx_functions, "%s", registration);
@@ -1259,9 +1284,9 @@ int EMBIND::functionWrapper(Node *n) {
           Delete(namespaces);
           Delete(registration);
         } else if (isJSPI) {
-          Printf(f_cxx_functions, "    if (crossbind::claimFunction(\"%s\", %d)) emscripten::function(\"%s\", &%s, emscripten::async()%s);\n", jsName, bindingArity(parms), jsName, name, pointerPolicy);
+          Printf(f_cxx_functions, "    if (crossbind::claimFunction(\"%s\", %d)) emscripten::function(\"%s\", &%s, emscripten::async()%s);\n", jsName, bindingArity(parms), jsName, callee, pointerPolicy);
         } else {
-          Printf(f_cxx_functions, "    if (crossbind::claimFunction(\"%s\", %d)) emscripten::function(\"%s\", &%s%s);\n", jsName, bindingArity(parms), jsName, name, pointerPolicy);
+          Printf(f_cxx_functions, "    if (crossbind::claimFunction(\"%s\", %d)) emscripten::function(\"%s\", &%s%s);\n", jsName, bindingArity(parms), jsName, callee, pointerPolicy);
         }
         String *exported = NewStringf("\"%s\"", jsName);
         if (!Strstr(exports, exported)) Printf(exports, ", %s", exported);
