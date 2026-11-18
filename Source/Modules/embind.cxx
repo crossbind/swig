@@ -577,6 +577,12 @@ static bool passesClassByValue(const SwigType *t) {
   return result;
 }
 
+// A method %extend adds is a function of its own, which takes the object as its first argument, a raw pointer.
+static bool isExtension(Node *n) {
+  Node *owner = parentNode(n);
+  return owner && Equal(nodeType(owner), "extend");
+}
+
 // embind registers no char* type and cannot hold incomplete types: the adapter speaks crossbind::JsPointer to JS.
 // Kept on one line so bridgeAsyncGuard can wrap a _JSPI registration in #ifdef.
 static String *bindingAdapter(Node *n, ParmList *parms, const_String_or_char_ptr callee, const String *scope) {
@@ -589,6 +595,7 @@ static String *bindingAdapter(Node *n, ParmList *parms, const_String_or_char_ptr
     if (Len(decls) != 0) Append(decls, ", ");
     if (GetFlag(p, "self")) {
       Printf(decls, "%s", SwigType_str(pType, "self"));
+      if (isExtension(n)) Append(args, "self");
       continue;
     }
     String *arg = NewStringf("arg%d", argnum++);
@@ -1119,7 +1126,10 @@ int EMBIND::functionWrapper(Node *n) {
   bool needsAdapter = !isConstructor && (returnsMoveOnly(Getattr(n, "type")) || returnForm(n) != PLAIN_ARGUMENT || returnsReferenceAsPointer(n) || returnsUniquePtrReference(n) || returnsUncopyableValue(n) || returnsUnknownValue(n) || returnsVectorOfUnknown(n));
   bool hasRawPointer = !isConstructor && !needsAdapter && (isRawPointer(Getattr(n, "type")) || mayHidePointer(n, Getattr(n, "type")));
   for (Parm *p = parms; p; p = nextSibling(p)) {
-    if (GetFlag(p, "self")) continue;
+    if (GetFlag(p, "self")) {
+      if (isExtension(n)) hasRawPointer = true;
+      continue;
+    }
     if (argumentForm(n, Getattr(p, "type"), 0) != PLAIN_ARGUMENT) {
       needsAdapter = true;
     } else if (isRawPointer(Getattr(p, "type")) || mayHidePointer(n, Getattr(p, "type"))) {
@@ -1222,7 +1232,7 @@ int EMBIND::functionWrapper(Node *n) {
             Printf(f_cxx_wrapper, "    .function(\"%s\", emscripten::optional_override([](%s& self%s) {\n      return self.%s(%s);\n    }))\n", name, className, params, name, variables);
           }
         } else if (needsAdapter || isUsingSameName) {
-          String *callee = NewStringf("self->%s", name);
+          String *callee = isExtension(n) ? Copy(funcName) : NewStringf("self->%s", name);
           Printf(f_cxx_wrapper, "    .function(\"%s\", %s%s, emscripten::allow_raw_pointers())\n", name, bindingAdapter(n, parms, callee, className), isJSPI && !isUsingSameName ? ", emscripten::async()" : "");
         } else if (isJSPI) {
           Printf(f_cxx_wrapper, "    .function(\"%s\", &%s, emscripten::async()%s)\n", name, funcName, pointerPolicy);
