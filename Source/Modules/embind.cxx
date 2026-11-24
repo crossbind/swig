@@ -577,15 +577,17 @@ static bool passesClassByValue(const SwigType *t) {
   return result;
 }
 
-// A method %extend adds is a function of its own, which takes the object as its first argument, a raw pointer.
+// A method %extend adds is a function of its own, which takes the object as its first argument, a raw pointer. A
+// constructor it adds is a function that returns the new object.
 static bool isExtension(Node *n) {
   Node *owner = parentNode(n);
   return owner && Equal(nodeType(owner), "extend");
 }
 
 // embind registers no char* type and cannot hold incomplete types: the adapter speaks crossbind::JsPointer to JS.
-// Kept on one line so bridgeAsyncGuard can wrap a _JSPI registration in #ifdef.
-static String *bindingAdapter(Node *n, ParmList *parms, const_String_or_char_ptr callee, const String *scope) {
+// Kept on one line so bridgeAsyncGuard can wrap a _JSPI registration in #ifdef. With `adopts`, a std::shared_ptr takes
+// the object the callee returns.
+static String *bindingAdapter(Node *n, ParmList *parms, const_String_or_char_ptr callee, const String *scope, bool adopts = false) {
   String *decls = NewString("");
   String *args = NewString("");
   int argnum = 0;
@@ -623,6 +625,11 @@ static String *bindingAdapter(Node *n, ParmList *parms, const_String_or_char_ptr
   String *call = NewStringf("%s(%s)", callee, args);
   String *returned = Equal(nodeType(n), "constructor") ? Copy(call) : returnExpression(n, call);
   if (!Equal(returned, call)) usesPointerRuntime = true;
+  if (adopts) {
+    String *owned = NewStringf("crossbind::adopt(%s)", returned);
+    Delete(returned);
+    returned = owned;
+  }
   String *adapter = NewStringf("emscripten::optional_override([](%s) { return %s; })", decls, returned);
   Delete(returned);
   Delete(call);
@@ -1166,7 +1173,20 @@ int EMBIND::functionWrapper(Node *n) {
   if (isConstructor) {
     if (!claimOverload(n, "constructor", className, name, parms)) return SWIG_OK;
     bool isPolymorphic = Getattr(parent, "feature:polymorphic_shared_ptr") != 0;
-    if (needsAdapter) {
+    if (isExtension(n)) {
+      // The class has no such constructor: the function %extend wrote makes the object, and the JS handle owns it. A
+      // handle cannot destroy an object of a class that hides its destructor, so adopt leaves that one alive.
+      if (isPolymorphic) {
+        static bool isAdoptPrinted = false;
+        if (!isAdoptPrinted) {
+          insertRuntime("embind_adopt.swg", f_cxx_header);
+          isAdoptPrinted = true;
+        }
+        Printf(f_cxx_wrapper, "    .smart_ptr_constructor(\"%s\", %s%s)\n", name, bindingAdapter(n, parms, funcName, className, true), pointerPolicy);
+      } else {
+        Printf(f_cxx_wrapper, "    .constructor(%s)\n", bindingAdapter(n, parms, funcName, className));
+      }
+    } else if (needsAdapter) {
       String *callee = NewStringf(isPolymorphic ? "std::make_shared<%s>" : "new %s", classSpelling);
       if (isPolymorphic) {
         Printf(f_cxx_wrapper, "    .smart_ptr_constructor(\"%s\", %s%s)\n", name, bindingAdapter(n, parms, callee, className), pointerPolicy);
